@@ -1,0 +1,128 @@
+---
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    outputs:
+      released: ${{ steps.release.outputs.released }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "lts/*"
+
+      - name: Release
+        id: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          npx --yes \
+            -p semantic-release \
+            -p @semantic-release/commit-analyzer \
+            -p @semantic-release/release-notes-generator \
+            -p @semantic-release/github \
+            semantic-release 2>&1 | tee release.log
+
+          version="$(grep -oP 'Published release \K[0-9]+\.[0-9]+\.[0-9]+' release.log | tail -1 || true)"
+
+          if [[ -n "${version}" ]]; then
+            echo "released=true" >> "$GITHUB_OUTPUT"
+            echo "version=${version}" >> "$GITHUB_OUTPUT"
+          else
+            echo "released=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  publish:
+    needs: version
+    if: needs.version.outputs.released == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          flavor: |
+            latest=false
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.version.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.version.outputs.version }}
+            type=semver,pattern={{major}},value=${{ needs.version.outputs.version }}
+            type=sha,format=long
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Dispatch the deploy bump
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_BUMP_TOKEN }}
+          BUMP_REPO: ${{ secrets.RELEASE_BUMP_REPO }}
+          APP: ${{ github.event.repository.name }}
+          IMAGE: ghcr.io/${{ github.repository }}
+          TAG: ${{ needs.version.outputs.version }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${GH_TOKEN}" || -z "${BUMP_REPO}" ]]; then
+            echo "::warning::RELEASE_BUMP_TOKEN or RELEASE_BUMP_REPO is not set; image published but not pinned."
+            exit 0
+          fi
+
+          for attempt in 1 2 3 4 5; do
+            if gh workflow run release-bump.yml \
+              --repo "${BUMP_REPO}" \
+              --ref main \
+              -f "app=${APP}" \
+              -f "tag=${TAG}" \
+              -f "digest=${DIGEST}" \
+              -f "image=${IMAGE}"; then
+              exit 0
+            fi
+            echo "::warning::dispatch attempt ${attempt} failed"
+            sleep 5
+          done
+
+          echo "::error::could not dispatch the deploy bump for ${APP} ${TAG} (${DIGEST})"
+          exit 1
