@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 
 import aiomqtt
@@ -19,6 +20,8 @@ DISCOVERY_PREFIX = os.environ.get("DISCOVERY_PREFIX", "homeassistant")
 # silence means the TCP session is dead even if the socket has not noticed.
 SILENCE_TIMEOUT = int(os.environ.get("SILENCE_TIMEOUT", "60"))
 RECONNECT_DELAY = int(os.environ.get("RECONNECT_DELAY", "10"))
+# The thermostat closes a session after ~30 s without traffic from the client.
+KEEPALIVE_INTERVAL = int(os.environ.get("KEEPALIVE_INTERVAL", "10"))
 
 BRIDGE_AVAILABILITY = f"{TOPIC_PREFIX}/bridge/availability"
 
@@ -33,6 +36,7 @@ class Thermostat:
     max_temp: float = 35.0
     writer: asyncio.StreamWriter | None = field(default=None, repr=False)
     discovered: bool = False
+    last_status: float = float("-inf")
 
     @property
     def base(self) -> str:
@@ -145,6 +149,7 @@ async def handle_line(
         thermostat.send("S00", "-1")
     elif command == "S00" and thermostat.device_id == device_id:
         status = parse_status(data)
+        thermostat.last_status = time.monotonic()
         thermostat.min_temp = status.get("min_temp", thermostat.min_temp)
         thermostat.max_temp = status.get("max_temp", thermostat.max_temp)
         if not thermostat.discovered:
@@ -166,6 +171,7 @@ async def thermostat_session(client: aiomqtt.Client, thermostat: Thermostat) -> 
         asyncio.open_connection(thermostat.host, thermostat.port), 10
     )
     thermostat.writer = writer
+    keepalive = asyncio.create_task(send_keepalive(thermostat))
     try:
         writer.write(b"/SCINANIOT/DEVICE_REQUEST\n")
         while True:
@@ -174,8 +180,16 @@ async def thermostat_session(client: aiomqtt.Client, thermostat: Thermostat) -> 
                 raise ConnectionError("closed by thermostat")
             await handle_line(client, thermostat, raw.decode(errors="replace").strip())
     finally:
+        keepalive.cancel()
         thermostat.writer = None
         writer.close()
+
+
+async def send_keepalive(thermostat: Thermostat) -> None:
+    while True:
+        await asyncio.sleep(KEEPALIVE_INTERVAL)
+        if thermostat.writer is not None and thermostat.device_id is not None:
+            thermostat.send("S00", "-1")
 
 
 async def run_thermostat(client: aiomqtt.Client, thermostat: Thermostat) -> None:
@@ -189,8 +203,11 @@ async def run_thermostat(client: aiomqtt.Client, thermostat: Thermostat) -> None
                 "%s (%s): %s",
                 thermostat.name,
                 thermostat.host,
-                err or type(err).__name__,
+                str(err) or type(err).__name__,
             )
+        if time.monotonic() - thermostat.last_status < SILENCE_TIMEOUT:
+            await asyncio.sleep(1)
+            continue
         if thermostat.device_id:
             await client.publish(
                 f"{thermostat.base}/availability", "offline", qos=1, retain=True
