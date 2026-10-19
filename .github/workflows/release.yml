@@ -58,6 +58,9 @@ jobs:
     needs: version
     if: needs.version.outputs.released == 'true'
     runs-on: ubuntu-latest
+    # The bump secrets are environment secrets, and `release` deploys from main
+    # only, so no job on another branch is handed the token.
+    environment: release
     timeout-minutes: 15
     permissions:
       contents: read
