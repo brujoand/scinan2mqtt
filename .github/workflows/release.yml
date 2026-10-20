@@ -59,7 +59,8 @@ jobs:
     if: needs.version.outputs.released == 'true'
     runs-on: ubuntu-latest
     # The bump secrets are environment secrets, and `release` deploys from main
-    # only, so no job on another branch is handed the token.
+    # only. A branch that edits this workflow to run on its own push is
+    # therefore not handed the token.
     environment: release
     timeout-minutes: 15
     permissions:
@@ -109,8 +110,8 @@ jobs:
           set -euo pipefail
 
           if [[ -z "${GH_TOKEN}" || -z "${BUMP_REPO}" ]]; then
-            echo "::warning::RELEASE_BUMP_TOKEN or RELEASE_BUMP_REPO is not set; image published but not pinned."
-            exit 0
+            echo "::error::RELEASE_BUMP_TOKEN or RELEASE_BUMP_REPO is not set in the release environment; image published but not pinned."
+            exit 1
           fi
 
           for attempt in 1 2 3 4 5; do
